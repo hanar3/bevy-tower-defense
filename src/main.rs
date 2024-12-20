@@ -34,6 +34,12 @@ struct Target(Option<Entity>);
 struct FireRate(f32);
 
 #[derive(Component)]
+struct Hp(u32);
+
+#[derive(Component)]
+struct ProjectedHp(u32);
+
+#[derive(Component)]
 struct Cooldown(Timer);
 
 fn setup_tower(
@@ -85,6 +91,8 @@ fn spawn_enemy(
                 Velocity(100.0),
                 Direction(player_transform.translation - enemy_transform.translation),
                 Collided(false),
+                Hp(100),
+                ProjectedHp(100),
             ));
         }
     }
@@ -132,18 +140,18 @@ fn despawn_collided_enemies(
 }
 
 fn tower_choose_target(
-    query: Query<(Entity, &Transform), With<Enemy>>,
+    query: Query<(Entity, &Transform, &ProjectedHp), With<Enemy>>,
     player: Single<(&Transform, &mut Target), With<Player>>,
 ) {
     let (player_transform, mut target) = player.into_inner();
 
     let mut closest_enemy: Option<Entity> = None;
     let mut distance_to_player = f32::MAX;
-    for (entity, enemy_transform) in &query {
+    for (entity, enemy_transform, enemy_projected_hp) in &query {
         let curr_distance_to_player = enemy_transform
             .translation
             .distance(player_transform.translation);
-        if curr_distance_to_player < distance_to_player {
+        if curr_distance_to_player < distance_to_player && enemy_projected_hp.0 > 0 {
             closest_enemy = Some(entity);
             distance_to_player = curr_distance_to_player;
         }
@@ -155,7 +163,7 @@ fn tower_choose_target(
 fn tower_shoot_target(
     time: Res<Time>,
     mut commands: Commands,
-    query: Query<(Entity, &Transform), With<Enemy>>,
+    mut query: Query<(Entity, &Transform, &mut ProjectedHp), With<Enemy>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     player: Single<(&Range, &mut Cooldown, &Transform, &mut Target), With<Player>>,
@@ -166,23 +174,25 @@ fn tower_shoot_target(
     if let Some(enemy) = target.0 {
         let color = Color::hsl(360., 0.95, 0.7);
 
-        if let Ok((_, enemy_transform)) = query.get(enemy) {
+        if let Ok((_, enemy_transform, mut enemy_projected_hp)) = query.get_mut(enemy) {
             let distance_to_player = enemy_transform
                 .translation
                 .distance(player_transform.translation);
 
-            if distance_to_player < player_range.0 {
-                if cooldown.0.just_finished() {
-                    commands.spawn((
-                        Mesh2d(meshes.add(Circle::new(5.0))),
-                        MeshMaterial2d(materials.add(color)),
-                        player_transform.clone(),
-                        Velocity(100.0),
-                        Projectile,
-                        Target(Some(enemy)),
-                        Direction(enemy_transform.translation - player_transform.translation),
-                    ));
-                }
+            if distance_to_player < player_range.0
+                && cooldown.0.just_finished()
+                && enemy_projected_hp.0 > 0
+            {
+                commands.spawn((
+                    Mesh2d(meshes.add(Circle::new(5.0))),
+                    MeshMaterial2d(materials.add(color)),
+                    player_transform.clone(),
+                    Velocity(100.0),
+                    Projectile,
+                    Target(Some(enemy)),
+                    Direction(enemy_transform.translation - player_transform.translation),
+                ));
+                enemy_projected_hp.0 -= 50;
             }
         }
     }
@@ -200,7 +210,7 @@ fn update_projectiles_position(
 fn check_projectile_collision(
     mut commands: Commands,
     mut query: Query<(Entity, &Transform, &Direction, &Velocity, &Target), With<Projectile>>,
-    enemies: Query<&Transform, With<Enemy>>,
+    mut enemies: Query<(&Transform, &mut Hp), With<Enemy>>,
 ) {
     for (projectile_entity, transform, _direction, _velocity, &Target(maybe_enemy_entity)) in
         &mut query
@@ -208,7 +218,7 @@ fn check_projectile_collision(
         let enemy_entity =
             maybe_enemy_entity.expect("Projectiles are alawys expected to have a target?");
 
-        if let Ok(enemy_transform) = enemies.get(enemy_entity) {
+        if let Ok((enemy_transform, mut enemy_hp)) = enemies.get_mut(enemy_entity) {
             let bounding_circle = BoundingCircle::new(transform.translation.truncate(), 5.0 / 2.);
             let bounding_box = Aabb2d::new(
                 enemy_transform.translation.truncate(),
@@ -216,7 +226,7 @@ fn check_projectile_collision(
             );
 
             if bounding_circle.intersects(&bounding_box) {
-                commands.entity(enemy_entity).despawn();
+                enemy_hp.0 -= 50;
                 commands.entity(projectile_entity).despawn();
             }
         } else {
@@ -225,11 +235,19 @@ fn check_projectile_collision(
     }
 }
 
+fn despawn_dead_enemies(mut commands: Commands, query: Query<(Entity, &Hp), With<Enemy>>) {
+    for (entity, hp) in &query {
+        if hp.0 <= 0 {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 pub struct HelloPlugin;
 impl Plugin for HelloPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(EnemySpawnTimer(Timer::from_seconds(
-            2.0,
+            0.5,
             TimerMode::Repeating,
         )));
         app.add_systems(Startup, setup_tower);
@@ -238,6 +256,7 @@ impl Plugin for HelloPlugin {
             (
                 spawn_enemy,
                 update_enemy_position,
+                despawn_dead_enemies,
                 (tower_choose_target, tower_shoot_target).chain(),
                 (update_projectiles_position, check_projectile_collision).chain(),
                 (check_enemy_player_collision, despawn_collided_enemies).chain(),
